@@ -62,7 +62,12 @@ def main():
 
     m5 = get_bars(SYMBOL, "5min", 500)
     if m5 is None or len(m5) < 200:
-        print("Not enough data, skipping this run.")
+        print("Not enough 5-min data, skipping this run.")
+        return
+
+    m1 = get_bars(SYMBOL, "1min", 1000)
+    if m1 is None or len(m1) < 150:
+        print("Not enough 1-min data, skipping this run.")
         return
 
     latest_bar_time = m5.index[-1]
@@ -74,7 +79,11 @@ def main():
     close_15 = m5['close'].resample('15min').last().dropna()
     slow_smma_15 = rma(close_15, SLOW_LEN)
     slow_smma_5m = slow_smma_15.shift(1).reindex(m5.index, method='ffill')
-    fast_smma_5m = rma(m5['close'], FAST_LEN)
+
+    # Fast SMMA: computed on TRUE 1-min closes (matches the indicator exactly), then
+    # aligned to the latest 5-min bar's timestamp for the bias comparison.
+    fast_smma_1m = rma(m1['close'], FAST_LEN)
+    fast_smma_5m = fast_smma_1m.reindex(m5.index, method='ffill')
 
     bull_bias = fast_smma_5m.iloc[-1] < slow_smma_5m.iloc[-1]
     bear_bias = fast_smma_5m.iloc[-1] > slow_smma_5m.iloc[-1]
