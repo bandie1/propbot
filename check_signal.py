@@ -22,7 +22,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TWELVEDATA_API_KEY = os.environ["TWELVEDATA_API_KEY"]
 
 SYMBOL = "XAU/USD"
-SMMA_LENGTH = 7
+SMMA_LENGTH = 15
 SMMA_INTERVAL = "15min"
 SIGNAL_INTERVAL = "5min"
 SMMA_HISTORY_SIZE = 150   # 15m candles pulled, for smoothing accuracy
