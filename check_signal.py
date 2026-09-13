@@ -1,151 +1,180 @@
 """
-XAUUSD SMMA Strategy - Single-run signal checker, designed for GitHub Actions.
-Each run: fetches latest data, checks for a new signal, alerts via Telegram, saves state to state.json.
+XAUUSD SMMA(7) Crossover Alert - Single-run checker for GitHub Actions.
+
+Replicates this Pine Script v6 logic exactly:
+    len = 7
+    src = close
+    smma := na(smma[1]) ? ta.sma(src, len) : (smma[1]*(len-1) + src) / len
+
+The SMMA is computed on FIXED 15-minute closes. The price checked against
+it is the 5-minute close (matching the indicator with timeframe="15"
+viewed on a 5-minute chart). Sends ONE Telegram alert per actual cross
+(not repeatedly while price sits on one side) using state.json.
 """
 
-import pandas as pd
 import requests
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TWELVEDATA_API_KEY = os.environ["TWELVEDATA_API_KEY"]
+
 SYMBOL = "XAU/USD"
-SLOW_LEN = 15
-FAST_LEN = 100
-MIN_SLOPE_DOLLARS = 0.5
+SMMA_LENGTH = 7
+SMMA_INTERVAL = "15min"
+SIGNAL_INTERVAL = "5min"
+SMMA_HISTORY_SIZE = 150   # 15m candles pulled, for smoothing accuracy
 STATE_FILE = "state.json"
+HEARTBEAT_INTERVAL_SECONDS = 2 * 60 * 60   # 2 hours
+
 
 def send_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg,
+                                  "parse_mode": "HTML"}, timeout=10)
     except Exception as e:
         print(f"Telegram send failed: {e}")
 
-def get_bars(symbol, interval="5min", outputsize=500):
+
+def get_closes(interval, outputsize):
     url = "https://api.twelvedata.com/time_series"
-    params = {"symbol": symbol, "interval": interval, "outputsize": outputsize, "apikey": TWELVEDATA_API_KEY}
+    params = {
+        "symbol": SYMBOL,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": TWELVEDATA_API_KEY,
+        "order": "ASC",
+    }
     r = requests.get(url, params=params, timeout=20)
     data = r.json()
     if "values" not in data:
-        print("API error/response:", data)
-        return None
-    df = pd.DataFrame(data["values"])
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df = df.set_index("datetime").sort_index()
-    for col in ["open", "high", "low", "close"]:
-        df[col] = df[col].astype(float)
-    return df[["open", "high", "low", "close"]]
+        print(f"API error for interval={interval}:", data)
+        return None, None
+    closes = [float(c["close"]) for c in data["values"]]
+    times = [c["datetime"] for c in data["values"]]
+    return times, closes
 
-def rma(series, length):
-    return series.ewm(alpha=1/length, adjust=False).mean()
+
+def compute_smma_series(closes, length):
+    smma_values = [None] * len(closes)
+    if len(closes) < length:
+        return smma_values
+    seed = sum(closes[:length]) / length
+    smma_values[length - 1] = seed
+    prev = seed
+    for i in range(length, len(closes)):
+        prev = (prev * (length - 1) + closes[i]) / length
+        smma_values[i] = prev
+    return smma_values
+
+
+def maybe_send_heartbeat(state, latest_close=None, latest_smma=None):
+    """Send a 'still alive' ping every HEARTBEAT_INTERVAL_SECONDS, independent
+    of whether a cross happened. Lets you know within 2 hours if the bot
+    silently stops running (e.g. API quota exhausted, workflow disabled)."""
+    now = datetime.now(timezone.utc)
+    last_hb = state.get("last_heartbeat")
+    if last_hb is not None:
+        last_hb_dt = datetime.fromisoformat(last_hb)
+        if (now - last_hb_dt).total_seconds() < HEARTBEAT_INTERVAL_SECONDS:
+            return
+    price_info = ""
+    if latest_close is not None and latest_smma is not None:
+        price_info = f"\nPrice: {latest_close:.3f} | SMMA(7): {latest_smma:.3f}"
+    send_telegram(
+        f"✅ Bot heartbeat — still running.{price_info}\n"
+        f"Time (UTC): {now.strftime('%Y-%m-%d %H:%M')}"
+    )
+    state["last_heartbeat"] = now.isoformat()
+
 
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
-    return {"above_smma": True, "in_trade": False, "trade_dir": None, "last_processed_bar": None}
+    return {"last_relation": None, "last_processed_bar": None, "last_heartbeat": None}
+
 
 def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f)
 
+
 def main():
     state = load_state()
-    above_smma = state["above_smma"]
-    in_trade = state["in_trade"]
-    trade_dir = state["trade_dir"]
-    last_processed_bar = state["last_processed_bar"]
 
-    m5 = get_bars(SYMBOL, "5min", 500)
-    if m5 is None or len(m5) < 200:
-        print("Not enough 5-min data, skipping this run.")
+    times_15, closes_15 = get_closes(SMMA_INTERVAL, SMMA_HISTORY_SIZE)
+    if closes_15 is None or len(closes_15) < SMMA_LENGTH:
+        print("Not enough 15m data, skipping this run.")
         return
 
-    m1 = get_bars(SYMBOL, "1min", 1000)
-    if m1 is None or len(m1) < 150:
-        print("Not enough 1-min data, skipping this run.")
+    smma_series = compute_smma_series(closes_15, SMMA_LENGTH)
+    latest_smma = smma_series[-1]
+    latest_smma_time = times_15[-1]
+
+    times_5, closes_5 = get_closes(SIGNAL_INTERVAL, 3)
+    if closes_5 is None or len(closes_5) < 2:
+        print("Not enough 5m data, skipping this run.")
+        maybe_send_heartbeat(state, latest_smma=latest_smma)
+        save_state(state)
         return
 
-    latest_bar_time = m5.index[-1]
-    latest_bar_str = latest_bar_time.isoformat()
-    if latest_bar_str == last_processed_bar:
-        print("No new bar yet.")
+    latest_time = times_5[-1]
+    prev_close = closes_5[-2]
+    latest_close = closes_5[-1]
+
+    # Heartbeat check runs every cycle regardless of whether there's a new
+    # bar or a cross, so it fires reliably every ~2 hours.
+    maybe_send_heartbeat(state, latest_close=latest_close, latest_smma=latest_smma)
+
+    if latest_time == state.get("last_processed_bar"):
+        print("No new 5m bar yet.")
+        save_state(state)
         return
 
-    close_15 = m5['close'].resample('15min').last().dropna()
-    slow_smma_15 = rma(close_15, SLOW_LEN)
-    slow_smma_5m = slow_smma_15.shift(1).reindex(m5.index, method='ffill')
+    def relation(price):
+        if price > latest_smma:
+            return "above"
+        elif price < latest_smma:
+            return "below"
+        return "equal"
 
-    # Fast SMMA: computed on TRUE 1-min closes (matches the indicator exactly), then
-    # aligned to the latest 5-min bar's timestamp for the bias comparison.
-    fast_smma_1m = rma(m1['close'], FAST_LEN)
-    fast_smma_5m = fast_smma_1m.reindex(m5.index, method='ffill')
+    prev_relation = relation(prev_close)
+    current_relation = relation(latest_close)
 
-    bull_bias = fast_smma_5m.iloc[-1] < slow_smma_5m.iloc[-1]
-    bear_bias = fast_smma_5m.iloc[-1] > slow_smma_5m.iloc[-1]
+    crossed = (
+        prev_relation != current_relation
+        and current_relation != "equal"
+        and state.get("last_relation") != current_relation
+    )
 
-    h1 = m5.resample('1h').agg({'high':'max','low':'min'}).dropna()
-    h1_high_shift = h1['high'].shift(1).reindex(m5.index, method='ffill')
-    h1_low_shift  = h1['low'].shift(1).reindex(m5.index, method='ffill')
-    touching_1h = (h1_high_shift.iloc[-1] >= slow_smma_5m.iloc[-1]) and (h1_low_shift.iloc[-1] <= slow_smma_5m.iloc[-1])
+    print(f"15m SMMA({SMMA_LENGTH}) @ {latest_smma_time}: {latest_smma:.3f}")
+    print(f"5m close @ {latest_time}: {latest_close:.3f} (prev: {prev_close:.3f})")
+    print(f"Relation: prev={prev_relation}, current={current_relation}, "
+          f"stored={state.get('last_relation')}")
 
-    o30 = m5.resample('30min').agg({'open':'first','high':'max','low':'min','close':'last'}).dropna()
-    is_red = o30['close'] < o30['open']
-    is_green = o30['close'] > o30['open']
-    recent_high_val = o30['high'].shift(1).where(is_green & is_red.shift(1)).ffill()
-    recent_low_val  = o30['low'].shift(1).where(is_red & is_green.shift(1)).ffill()
-    recent_high = recent_high_val.iloc[-1] if len(recent_high_val) else None
-    recent_low  = recent_low_val.iloc[-1] if len(recent_low_val) else None
+    if crossed:
+        direction = "🔼 UP" if current_relation == "above" else "🔽 DOWN"
+        msg = (
+            f"XAUUSD SMMA Cross Alert\n"
+            f"Direction: {direction}\n"
+            f"Price crossed {current_relation} SMMA({SMMA_LENGTH}, 15m)\n\n"
+            f"Price (5m close): {latest_close:.3f}\n"
+            f"SMMA value: {latest_smma:.3f}\n"
+            f"Candle time (5m): {latest_time}\n"
+            f"SMMA time (15m): {latest_smma_time}"
+        )
+        send_telegram(msg)
+    else:
+        print("No new cross detected.")
 
-    close_30 = m5['close'].resample('30min').last().dropna()
-    slow_smma_30 = rma(close_30, SLOW_LEN)
-    smma_delta_30 = abs(slow_smma_30.iloc[-1] - slow_smma_30.iloc[-2]) if len(slow_smma_30) >= 2 else 0
-    slope_ok = smma_delta_30 >= MIN_SLOPE_DOLLARS
+    state["last_relation"] = current_relation
+    state["last_processed_bar"] = latest_time
+    save_state(state)
 
-    close_now = m5['close'].iloc[-1]
-    close_prev = m5['close'].iloc[-2]
-    slow_now = slow_smma_5m.iloc[-1]
-    slow_prev = slow_smma_5m.iloc[-2]
-    raw_cross_up   = (close_now > slow_now) and (close_prev <= slow_prev)
-    raw_cross_down = (close_now < slow_now) and (close_prev >= slow_prev)
-
-    debounced_up   = raw_cross_up and not above_smma
-    debounced_down = raw_cross_down and above_smma
-    if raw_cross_up: above_smma = True
-    if raw_cross_down: above_smma = False
-
-    ts_str = latest_bar_time.strftime('%Y-%m-%d %H:%M')
-
-    if in_trade and trade_dir == 'long' and debounced_down:
-        send_telegram(f"🔴 FAILSAFE EXIT LONG\n{SYMBOL} @ {close_now:.2f}\nTime: {ts_str}")
-        in_trade = False; trade_dir = None
-    if in_trade and trade_dir == 'short' and debounced_up:
-        send_telegram(f"🔴 FAILSAFE EXIT SHORT\n{SYMBOL} @ {close_now:.2f}\nTime: {ts_str}")
-        in_trade = False; trade_dir = None
-
-    if not in_trade:
-        if debounced_up and bull_bias and touching_1h and slope_ok:
-            sl = recent_low if recent_low else close_now - 3.0
-            sl_dist = close_now - sl
-            tp = close_now + sl_dist * 3
-            send_telegram(f"🟢 BUY SIGNAL\n{SYMBOL} @ {close_now:.2f}\nSL: {sl:.2f}  TP(3R): {tp:.2f}\nTime: {ts_str}")
-            in_trade = True; trade_dir = 'long'
-        elif debounced_down and bear_bias and touching_1h and slope_ok:
-            sl = recent_high if recent_high else close_now + 3.0
-            sl_dist = sl - close_now
-            tp = close_now - sl_dist * 3
-            send_telegram(f"🔴 SELL SIGNAL\n{SYMBOL} @ {close_now:.2f}\nSL: {sl:.2f}  TP(3R): {tp:.2f}\nTime: {ts_str}")
-            in_trade = True; trade_dir = 'short'
-
-    save_state({
-        "above_smma": above_smma, "in_trade": in_trade,
-        "trade_dir": trade_dir, "last_processed_bar": latest_bar_str
-    })
-    print(f"Checked bar {ts_str} - bull_bias={bull_bias} in_trade={in_trade}")
 
 if __name__ == "__main__":
     main()
